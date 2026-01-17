@@ -1,40 +1,28 @@
-# Telegram Moderation Bot
-# Features:
-# 1) Auto-approve join requests
-# 2) /adm - mention all admins
-# 3) Anti-swear: delete + reply "Не ругайся"
-# 4) /бан причина: ... (reply to a user)
-# 5) /мут на X <единица> причина: ... (reply to a user). If no time -> forever
-
 import asyncio
 import re
+import os
 from datetime import timedelta
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
 from aiogram.types import Message, ChatJoinRequest
 from aiogram.exceptions import TelegramBadRequest
 
-TOKEN = "8303271038:AAGXZE7rbezhalcUuBFcIllPqlHnh4bO30c"
+TOKEN = os.getenv("BOT_TOKEN")
 
-# ---- SETTINGS ----
 BAD_WORDS = [
-    # add your swear words here
     "мат1", "мат2", "мат3"
 ]
 
-# Regex helpers
 TIME_RE = re.compile(r"на\s+(\d+)\s*(минут|минуты|минута|час|часа|часов|день|дня|дней)", re.IGNORECASE)
 REASON_RE = re.compile(r"причина\s*:\s*(.+)", re.IGNORECASE)
 
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
 
-# ---- 1) AUTO-APPROVE JOIN REQUESTS ----
 @dp.chat_join_request()
 async def approve_request(join_request: ChatJoinRequest):
     await join_request.approve()
 
-# ---- 2) /adm ----
 @dp.message(Command("adm"))
 async def call_admins(message: Message):
     admins = await bot.get_chat_administrators(message.chat.id)
@@ -48,11 +36,10 @@ async def call_admins(message: Message):
     else:
         await message.answer("Администраторы не найдены")
 
-# ---- 3) ANTI-SWEAR ----
 def contains_bad_words(text: str) -> bool:
     t = text.lower()
     for w in BAD_WORDS:
-        if re.search(rf"\\b{re.escape(w)}\\b", t):
+        if re.search(rf"\b{re.escape(w)}\b", t):
             return True
     return False
 
@@ -65,16 +52,14 @@ async def anti_swear(message: Message):
             pass
         await message.answer("Не ругайся")
 
-# ---- Helpers for /ban and /mut ----
 def parse_reason(text: str) -> str:
     m = REASON_RE.search(text)
     return m.group(1).strip() if m else "Не указана"
 
-
 def parse_time(text: str):
     m = TIME_RE.search(text)
     if not m:
-        return None  # forever
+        return None
     value = int(m.group(1))
     unit = m.group(2).lower()
     if unit.startswith("мин"):
@@ -84,7 +69,6 @@ def parse_time(text: str):
     if unit.startswith("ден") or unit.startswith("дне"):
         return timedelta(days=value)
     return None
-
 
 def format_timedelta(td: timedelta) -> str:
     seconds = int(td.total_seconds())
@@ -99,7 +83,6 @@ def format_timedelta(td: timedelta) -> str:
     days = hours // 24
     return f"{days} дн"
 
-# ---- 4) /бан ----
 @dp.message(Command("бан"))
 async def ban_user(message: Message):
     if not message.reply_to_message:
@@ -118,7 +101,6 @@ async def ban_user(message: Message):
     except TelegramBadRequest as e:
         await message.answer(f"Ошибка: {e}")
 
-# ---- 5) /мут ----
 @dp.message(Command("мут"))
 async def mute_user(message: Message):
     if not message.reply_to_message:
@@ -150,8 +132,9 @@ async def mute_user(message: Message):
     except TelegramBadRequest as e:
         await message.answer(f"Ошибка: {e}")
 
-# ---- RUN ----
 async def main():
+    if not TOKEN:
+        raise ValueError("BOT_TOKEN not set")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
