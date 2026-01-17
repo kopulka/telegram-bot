@@ -1,23 +1,25 @@
 import asyncio
 import os
 import re
-from datetime import timedelta, datetime
+from datetime import datetime, timedelta
 from aiohttp import web
 
 from aiogram import Bot, Dispatcher, F
+from aiogram.types import Message, ChatJoinRequest
 from aiogram.filters import Command
-from aiogram.types import Message, ChatJoinRequest, ChatPermissions
+from aiogram.enums import ChatMemberStatus
 from aiogram.exceptions import TelegramBadRequest
 
 TOKEN = os.getenv("BOT_TOKEN")
-
 if not TOKEN:
     raise ValueError("BOT_TOKEN not set")
 
-bot = Bot(token=TOKEN)
+bot = Bot(token=TOKEN, parse_mode="HTML")
 dp = Dispatcher()
 
-# ================= WEB SERVER FOR RENDER =================
+active_mutes = {}
+
+# ================= WEB SERVER (Render) =================
 async def handle(request):
     return web.Response(text="Bot is running")
 
@@ -29,178 +31,166 @@ async def start_web():
     port = int(os.getenv("PORT", 10000))
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
-# =======================================================
+# =====================================================
 
 
-TIME_RE = re.compile(r"(\d+)\s*(мин|мину|минут|час|часа|часов|день|дня|дней|нед|недел)", re.IGNORECASE)
-
-def parse_time(text):
-    m = TIME_RE.search(text)
-    if not m:
+def parse_duration(text: str):
+    text = text.lower()
+    match = re.search(r"(\d+)\s*(м|мин|минут|час|часа|часов|день|дня|дней|неделя|недель)", text)
+    if not match:
         return None
 
-    value = int(m.group(1))
-    unit = m.group(2).lower()
+    value = int(match.group(1))
+    unit = match.group(2)
 
-    if unit.startswith("мин"):
+    if "м" in unit:
         return timedelta(minutes=value)
-    if unit.startswith("час"):
+    if "час" in unit:
         return timedelta(hours=value)
-    if unit.startswith("ден"):
+    if "д" in unit:
         return timedelta(days=value)
-    if unit.startswith("нед"):
+    if "нед" in unit:
         return timedelta(days=value * 7)
+
     return None
 
 
 async def is_admin(chat_id, user_id):
     admins = await bot.get_chat_administrators(chat_id)
-    return any(a.user.id == user_id for a in admins)
+    for admin in admins:
+        if admin.user.id == user_id:
+            return True
+    return False
 
 
-# ================= AUTO APPROVE =================
 @dp.chat_join_request()
 async def approve_request(join_request: ChatJoinRequest):
-    try:
-        await join_request.approve()
-    except:
-        pass
-# ==============================================
+    await join_request.approve()
 
 
-# ================= /adm =================
-@dp.message(F.text.lower().startswith("/adm"))
+@dp.message(Command("adm"))
 async def call_admins(message: Message):
     admins = await bot.get_chat_administrators(message.chat.id)
     mentions = []
     for admin in admins:
-        u = admin.user
-        if not u.is_bot:
-            mentions.append(f"<a href='tg://user?id={u.id}'>@{u.username or u.first_name}</a>")
-
+        if not admin.user.is_bot:
+            mentions.append(f"<b><a href='tg://user?id={admin.user.id}'>{admin.user.first_name}</a></b>")
     if mentions:
-        await message.answer(
-            f"<b>🚨 ВЫЗЫВ АДМИНИСТРАТОРОВ / ГАРАНТОВ</b>\n" + " ".join(mentions),
-            parse_mode="HTML"
-        )
-# ======================================
+        await message.answer("🚨 <b>ВЫЗЫВ АДМИНИСТРАТОРОВ/ГАРАНТОВ</b>\n" + " ".join(mentions))
+    else:
+        await message.answer("<b>Администраторы не найдены</b>")
 
 
-# ================= MUTE =================
+async def auto_unmute(chat_id, user_id, until, username):
+    await asyncio.sleep((until - datetime.now()).total_seconds())
+    try:
+        await bot.restrict_chat_member(chat_id, user_id, permissions=None)
+        await bot.send_message(chat_id, f"✅ <b>Срок молчания @{username} истёк</b>")
+    except:
+        pass
+
+
 @dp.message(F.text.lower().startswith("мут"))
-async def mute_user(message: Message):
+async def mute_handler(message: Message):
     if not await is_admin(message.chat.id, message.from_user.id):
         return
 
     if not message.reply_to_message:
-        return await message.answer("<b>Ответь на сообщение пользователя.</b>", parse_mode="HTML")
+        return
 
-    delta = parse_time(message.text)
-    until_date = None
-    end_time_text = "навсегда"
+    duration = parse_duration(message.text)
+    if not duration:
+        await message.reply("❌ <b>Укажи время: мут 1 час</b>")
+        return
 
-    if delta:
-        until_date = datetime.utcnow() + delta
-        end_time_text = until_date.strftime("%d.%m.%Y %H:%M")
+    reason = message.text.split("\n", 1)
+    reason = reason[1] if len(reason) > 1 else "Не указана"
 
-    target = message.reply_to_message.from_user
-    admin = message.from_user
+    user = message.reply_to_message.from_user
+    until = datetime.now() + duration
 
     try:
         await bot.restrict_chat_member(
             message.chat.id,
-            target.id,
-            permissions=ChatPermissions(can_send_messages=False),
-            until_date=until_date
+            user.id,
+            permissions=None,
+            until_date=until
         )
 
         await message.answer(
-            f"<b>‼️ Участник @{target.username or target.first_name} замучен до {end_time_text} администратором (@{admin.username or admin.first_name})</b>",
-            parse_mode="HTML"
+            f"‼️ <b>Участник @{user.username} замучен до {until.strftime('%d.%m.%Y %H:%M')}</b>\n"
+            f"<b>Администратор:</b> @{message.from_user.username}\n"
+            f"<b>Причина:</b> {reason}"
         )
-    except TelegramBadRequest as e:
-        await message.answer(f"<b>Ошибка: {e}</b>", parse_mode="HTML")
-# =======================================
+
+        asyncio.create_task(auto_unmute(message.chat.id, user.id, until, user.username))
+
+    except TelegramBadRequest:
+        await message.reply("❌ <b>Не удалось замутить</b>")
 
 
-# ================= UNMUTE =================
 @dp.message(F.text.lower().startswith("размут"))
-async def unmute_user(message: Message):
+async def unmute_handler(message: Message):
     if not await is_admin(message.chat.id, message.from_user.id):
         return
 
     if not message.reply_to_message:
-        return await message.answer("<b>Ответь на сообщение пользователя.</b>", parse_mode="HTML")
+        return
 
-    target = message.reply_to_message.from_user
-    admin = message.from_user
+    user = message.reply_to_message.from_user
 
     try:
-        await bot.restrict_chat_member(
-            message.chat.id,
-            target.id,
-            permissions=ChatPermissions(
-                can_send_messages=True,
-                can_send_media_messages=True,
-                can_send_other_messages=True,
-                can_add_web_page_previews=True
-            )
-        )
-
+        await bot.restrict_chat_member(message.chat.id, user.id, permissions=None)
         await message.answer(
-            f"<b>✅ Участник @{target.username or target.first_name} был размучен администратором (@{admin.username or admin.first_name})</b>",
-            parse_mode="HTML"
+            f"✅ <b>Участник @{user.username} был размучен</b>\n"
+            f"<b>Администратор:</b> @{message.from_user.username}"
         )
-    except TelegramBadRequest as e:
-        await message.answer(f"<b>Ошибка: {e}</b>", parse_mode="HTML")
-# =========================================
+    except:
+        await message.reply("❌ <b>Ошибка размута</b>")
 
 
-# ================= BAN =================
 @dp.message(F.text.lower().startswith("бан"))
-async def ban_user(message: Message):
+async def ban_handler(message: Message):
     if not await is_admin(message.chat.id, message.from_user.id):
         return
 
     if not message.reply_to_message:
-        return await message.answer("<b>Ответь на сообщение пользователя.</b>", parse_mode="HTML")
+        return
 
-    target = message.reply_to_message.from_user
-    admin = message.from_user
+    reason = message.text.split("\n", 1)
+    reason = reason[1] if len(reason) > 1 else "Не указана"
+
+    user = message.reply_to_message.from_user
 
     try:
-        await bot.ban_chat_member(message.chat.id, target.id)
-
+        await bot.ban_chat_member(message.chat.id, user.id)
         await message.answer(
-            f"<b>‼️ Участник @{target.username or target.first_name} забанен администратором (@{admin.username or admin.first_name})</b>",
-            parse_mode="HTML"
+            f"‼️ <b>Участник @{user.username} забанен</b>\n"
+            f"<b>Администратор:</b> @{message.from_user.username}\n"
+            f"<b>Причина:</b> {reason}"
         )
-    except TelegramBadRequest as e:
-        await message.answer(f"<b>Ошибка: {e}</b>", parse_mode="HTML")
-# ======================================
+    except:
+        await message.reply("❌ <b>Ошибка бана</b>")
 
 
-# ================= UNBAN =================
 @dp.message(F.text.lower().startswith("разбан"))
-async def unban_user(message: Message):
+async def unban_handler(message: Message):
     if not await is_admin(message.chat.id, message.from_user.id):
         return
 
     if not message.reply_to_message:
-        return await message.answer("<b>Ответь на сообщение пользователя.</b>", parse_mode="HTML")
+        return
 
-    target = message.reply_to_message.from_user
+    user = message.reply_to_message.from_user
 
     try:
-        await bot.unban_chat_member(message.chat.id, target.id)
-
+        await bot.unban_chat_member(message.chat.id, user.id)
         await message.answer(
-            f"<b>✅ Участник @{target.username or target.first_name} разбанен</b>",
-            parse_mode="HTML"
+            f"✅ <b>Участник @{user.username} разбанен</b>\n"
+            f"<b>Администратор:</b> @{message.from_user.username}"
         )
-    except TelegramBadRequest as e:
-        await message.answer(f"<b>Ошибка: {e}</b>", parse_mode="HTML")
-# ========================================
+    except:
+        await message.reply("❌ <b>Ошибка разбана</b>")
 
 
 async def main():
