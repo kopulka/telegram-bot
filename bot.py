@@ -1,34 +1,31 @@
 import asyncio
 import os
 import re
-from datetime import timedelta, datetime
-from aiohttp import web
+import aiosqlite
+from datetime import datetime, timedelta, timezone
 
 from aiogram import Bot, Dispatcher, F
-from aiogram.types import Message, ChatJoinRequest
-from aiogram.exceptions import TelegramBadRequest
+from aiogram.types import Message, ChatPermissions, ChatJoinRequest
+from aiogram.filters import Command
+from aiogram.client.default import DefaultBotProperties
+
+from aiohttp import web
 
 TOKEN = os.getenv("BOT_TOKEN")
+
 if not TOKEN:
     raise ValueError("BOT_TOKEN not set")
 
-bot = Bot(token=TOKEN)
+bot = Bot(token=TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
 dp = Dispatcher()
 
-# =================== НАСТРОЙКИ ===================
+DB_PATH = "punishments.db"
 
-BAD_WORDS = ["мат1", "мат2", "мат3"]
 
-TIME_RE = re.compile(r"(\d+)\s*(минут|минуты|минута|час|часа|часов|день|дня|дней|неделя|недели|недель)", re.IGNORECASE)
-
-# Хранилище причин и сроков (в памяти)
-mutes = {}  # user_id: {"until": datetime|None, "reason": str, "admin": str}
-bans = {}   # user_id: {"reason": str, "admin": str}
-
-# =================== WEB (для Render) ===================
-
+# ================== WEB SERVER (Render) ==================
 async def handle(request):
     return web.Response(text="Bot is running")
+
 
 async def start_web():
     app = web.Application()
@@ -39,260 +36,195 @@ async def start_web():
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
 
-# =================== ВСПОМОГАТЕЛЬНЫЕ ===================
 
-def contains_bad_words(text: str) -> bool:
-    t = text.lower()
-    for w in BAD_WORDS:
-        if re.search(rf"\b{re.escape(w)}\b", t):
-            return True
-    return False
+# ================== DATABASE ==================
+async def init_db():
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS punishments (
+            user_id INTEGER,
+            username TEXT,
+            admin_id INTEGER,
+            admin_username TEXT,
+            type TEXT,
+            reason TEXT,
+            until TEXT
+        )
+        """)
+        await db.commit()
 
-def parse_time(text: str):
-    m = TIME_RE.search(text)
-    if not m:
-        return None
-    value = int(m.group(1))
-    unit = m.group(2).lower()
-    if unit.startswith("мин"):
-        return timedelta(minutes=value)
-    if unit.startswith("час"):
-        return timedelta(hours=value)
-    if unit.startswith("дн"):
-        return timedelta(days=value)
-    if unit.startswith("нед"):
-        return timedelta(days=value * 7)
-    return None
 
-async def is_admin(chat_id, user_id):
+# ================== HELPERS ==================
+async def is_admin(chat_id: int, user_id: int):
     admins = await bot.get_chat_administrators(chat_id)
     return any(a.user.id == user_id for a in admins)
 
-async def get_user_by_username(chat_id, username: str):
-    # Telegram API не даёт прямой поиск по username в чате,
-    # поэтому тут мы полагаемся на reply или упоминание.
-    # Если нужно — сделаю через кеш/БД.
+
+def parse_time(text: str):
+    match = re.search(r"(\d+)\s*(мин|минута|минут|час|часа|часов|день|дня|дней|неделя|недели|недель)", text.lower())
+    if not match:
+        return None
+
+    num = int(match.group(1))
+    unit = match.group(2)
+
+    if "мин" in unit:
+        return timedelta(minutes=num)
+    if "час" in unit:
+        return timedelta(hours=num)
+    if "день" in unit:
+        return timedelta(days=num)
+    if "нед" in unit:
+        return timedelta(weeks=num)
+
     return None
 
-def fmt_dt(dt: datetime):
-    return dt.strftime("%d.%m.%Y %H:%M")
 
-# =================== АВТОАПРУВ ===================
+async def get_user_from_text(message: Message):
+    if message.reply_to_message:
+        return message.reply_to_message.from_user
 
+    match = re.search(r"@(\w+)", message.text)
+    if match:
+        username = match.group(1)
+        try:
+            user = await bot.get_chat_member(message.chat.id, username)
+            return user.user
+        except:
+            return None
+
+    return None
+
+
+# ================== JOIN AUTO APPROVE ==================
 @dp.chat_join_request()
 async def approve_request(join_request: ChatJoinRequest):
     await join_request.approve()
 
-# =================== /adm (работает с текстом) ===================
 
+# ================== ADM CALL ==================
 @dp.message(F.text.lower().startswith("/adm"))
 async def call_admins(message: Message):
     admins = await bot.get_chat_administrators(message.chat.id)
     mentions = []
     for admin in admins:
-        u = admin.user
-        if not u.is_bot:
-            if u.username:
-                mentions.append(f"@{u.username}")
-            else:
-                mentions.append(f"<a href='tg://user?id={u.id}'>{u.first_name}</a>")
+        if not admin.user.is_bot:
+            mentions.append(f"@{admin.user.username}" if admin.user.username else admin.user.full_name)
+
     if mentions:
-        text = "<b>🚨 СОЗЫВ АДМИНИСТРАЦИИ:</b> " + ", ".join(mentions)
-        await message.answer(text, parse_mode="HTML")
+        await message.answer(f"<b>🚨 СОЗЫВ АДМИНИСТРАЦИИ:</b>\n" + ", ".join(mentions))
     else:
-        await message.answer("<b>Администраторы не найдены</b>", parse_mode="HTML")
+        await message.answer("<b>Администраторы не найдены</b>")
 
-# =================== АНТИМАТ ===================
 
-@dp.message(F.text)
-async def anti_swear(message: Message):
-    if contains_bad_words(message.text):
-        try:
-            await message.delete()
-        except:
-            pass
-        await message.answer("<b>Не ругайся</b>", parse_mode="HTML")
-
-# =================== МУТ ===================
-
+# ================== MUTE ==================
 @dp.message(F.text.lower().startswith("мут"))
 async def mute_user(message: Message):
     if not await is_admin(message.chat.id, message.from_user.id):
         return
 
-    target = None
-    if message.reply_to_message:
-        target = message.reply_to_message.from_user
-
-    if not target:
-        return await message.answer("<b>Ответь на сообщение пользователя.</b>", parse_mode="HTML")
+    user = await get_user_from_text(message)
+    if not user:
+        return await message.answer("<b>Не удалось найти пользователя</b>")
 
     delta = parse_time(message.text)
-    reason = message.text.replace("мут", "").strip() or "Не указана"
+    if not delta:
+        return await message.answer("<b>Укажи время: мут 1 час</b>")
 
-    until_date = None
-    time_text = "Навсегда"
-    if delta:
-        until_date = datetime.utcnow() + delta
-        time_text = fmt_dt(until_date)
+    reason_match = re.split(r"\n", message.text, 1)
+    reason = reason_match[1] if len(reason_match) > 1 else "Не указана"
 
-    try:
-        await bot.restrict_chat_member(
-            message.chat.id,
-            target.id,
-            permissions=None,
-            until_date=until_date
-        )
+    until = datetime.now(timezone.utc) + delta
 
-        mutes[target.id] = {
-            "until": until_date,
-            "reason": reason,
-            "admin": message.from_user.username or message.from_user.first_name
-        }
+    await bot.restrict_chat_member(
+        message.chat.id,
+        user.id,
+        ChatPermissions(can_send_messages=False),
+        until_date=until
+    )
 
-        text = (
-            f"<b>‼️Участник @{target.username or target.first_name} замучен до {time_text}</b> "
-            f"админом (@{message.from_user.username})\n\n"
-            f"<b>Причина:</b> {reason}"
-        )
-        await message.answer(text, parse_mode="HTML")
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("DELETE FROM punishments WHERE user_id=?", (user.id,))
+        await db.execute("""
+        INSERT INTO punishments VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, (user.id, user.username, message.from_user.id, message.from_user.username, "mute", reason, until.isoformat()))
+        await db.commit()
 
-        if until_date:
-            asyncio.create_task(auto_unmute(message.chat.id, target.id, until_date))
+    await message.answer(
+        f"<b>‼️Участник @{user.username} замучен до {until.strftime('%d.%m.%Y %H:%M')}</b>\n"
+        f"<b>Админ:</b> @{message.from_user.username}\n"
+        f"<b>Причина:</b> {reason}"
+    )
 
-    except TelegramBadRequest as e:
-        await message.answer(str(e))
 
-async def auto_unmute(chat_id, user_id, until_date: datetime):
-    await asyncio.sleep(max(0, (until_date - datetime.utcnow()).total_seconds()))
-    try:
-        await bot.restrict_chat_member(chat_id, user_id, permissions=None)
-        info = mutes.pop(user_id, None)
-        if info:
-            text = f"<b>✅Срок молчания @{user_id} истёк</b>"
-            await bot.send_message(chat_id, text, parse_mode="HTML")
-    except:
-        pass
-
-# =================== РАЗМУТ ===================
-
-@dp.message(F.text.lower().startswith("размут"))
-async def unmute_user(message: Message):
-    if not await is_admin(message.chat.id, message.from_user.id):
-        return
-
-    if not message.reply_to_message:
-        return await message.answer("<b>Ответь на сообщение пользователя.</b>", parse_mode="HTML")
-
-    target = message.reply_to_message.from_user
-
-    try:
-        await bot.restrict_chat_member(message.chat.id, target.id, permissions=None)
-        mutes.pop(target.id, None)
-
-        text = (
-            f"<b>✅Участник @{target.username or target.first_name} был размучен</b> "
-            f"админом (@{message.from_user.username})"
-        )
-        await message.answer(text, parse_mode="HTML")
-    except TelegramBadRequest as e:
-        await message.answer(str(e))
-
-# =================== БАН ===================
-
+# ================== BAN ==================
 @dp.message(F.text.lower().startswith("бан"))
 async def ban_user(message: Message):
     if not await is_admin(message.chat.id, message.from_user.id):
         return
 
-    if not message.reply_to_message:
-        return await message.answer("<b>Ответь на сообщение пользователя.</b>", parse_mode="HTML")
+    user = await get_user_from_text(message)
+    if not user:
+        return await message.answer("<b>Не удалось найти пользователя</b>")
 
-    target = message.reply_to_message.from_user
-    reason = message.text.replace("бан", "").strip() or "Не указана"
+    reason_match = re.split(r"\n", message.text, 1)
+    reason = reason_match[1] if len(reason_match) > 1 else "Не указана"
 
-    try:
-        await bot.ban_chat_member(message.chat.id, target.id)
+    await bot.ban_chat_member(message.chat.id, user.id)
 
-        bans[target.id] = {
-            "reason": reason,
-            "admin": message.from_user.username or message.from_user.first_name
-        }
-
-        text = (
-            f"<b>‼️Участник @{target.username or target.first_name} забанен</b> "
-            f"админом (@{message.from_user.username})\n\n"
-            f"<b>Причина:</b> {reason}"
-        )
-        await message.answer(text, parse_mode="HTML")
-
-    except TelegramBadRequest as e:
-        await message.answer(str(e))
-
-# =================== РАЗБАН ===================
-
-@dp.message(F.text.lower().startswith("разбан"))
-async def unban_user(message: Message):
-    if not await is_admin(message.chat.id, message.from_user.id):
-        return
-
-    if not message.reply_to_message:
-        return await message.answer("<b>Ответь на сообщение пользователя.</b>", parse_mode="HTML")
-
-    target = message.reply_to_message.from_user
-
-    try:
-        await bot.unban_chat_member(message.chat.id, target.id)
-        bans.pop(target.id, None)
-
-        text = (
-            f"<b>✅Участник @{target.username or target.first_name} был разбанен</b> "
-            f"админом (@{message.from_user.username})"
-        )
-        await message.answer(text, parse_mode="HTML")
-    except TelegramBadRequest as e:
-        await message.answer(str(e))
-
-# =================== ПРИЧИНА ===================
-
-@dp.message(F.text.lower().startswith("причина"))
-async def reason_user(message: Message):
-    if not await is_admin(message.chat.id, message.from_user.id):
-        return
-
-    if not message.reply_to_message:
-        return await message.answer("<b>Ответь на сообщение пользователя.</b>", parse_mode="HTML")
-
-    target = message.reply_to_message.from_user
-
-    if target.id in mutes:
-        info = mutes[target.id]
-        until = info["until"]
-        time_text = fmt_dt(until) if until else "Навсегда"
-        text = (
-            f"<b>‼️Участник @{target.username or target.first_name} замучен до {time_text}</b>\n\n"
-            f"<b>Причина:</b> {info['reason']}"
-        )
-        return await message.answer(text, parse_mode="HTML")
-
-    if target.id in bans:
-        info = bans[target.id]
-        text = (
-            f"<b>‼️Участник @{target.username or target.first_name} забанен</b>\n\n"
-            f"<b>Причина:</b> {info['reason']}"
-        )
-        return await message.answer(text, parse_mode="HTML")
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("DELETE FROM punishments WHERE user_id=?", (user.id,))
+        await db.execute("""
+        INSERT INTO punishments VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, (user.id, user.username, message.from_user.id, message.from_user.username, "ban", reason, None))
+        await db.commit()
 
     await message.answer(
-        f"<b>⭐️Участник @{target.username or target.first_name} не находится в бане или муте</b>",
-        parse_mode="HTML"
+        f"<b>‼️Участник @{user.username} забанен</b>\n"
+        f"<b>Админ:</b> @{message.from_user.username}\n"
+        f"<b>Причина:</b> {reason}"
     )
 
-# =================== ЗАПУСК ===================
 
+# ================== REASON ==================
+@dp.message(F.text.lower().startswith("причина"))
+async def reason_cmd(message: Message):
+    if not await is_admin(message.chat.id, message.from_user.id):
+        return
+
+    user = await get_user_from_text(message)
+    if not user:
+        return
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT * FROM punishments WHERE user_id=?", (user.id,)) as cursor:
+            row = await cursor.fetchone()
+
+    if not row:
+        return await message.answer(f"<b>⭐️Участник @{user.username} не находится в муте или бане</b>")
+
+    _, _, _, admin_username, ptype, reason, until = row
+
+    if ptype == "mute":
+        until_dt = datetime.fromisoformat(until)
+        text = f"<b>МУТ до {until_dt.strftime('%d.%m.%Y %H:%M')}</b>"
+    else:
+        text = "<b>БАН</b>"
+
+    await message.answer(
+        f"<b>‼️Участник @{user.username}</b>\n"
+        f"{text}\n"
+        f"<b>Админ:</b> @{admin_username}\n"
+        f"<b>Причина:</b> {reason}"
+    )
+
+
+# ================== START ==================
 async def main():
+    await init_db()
     await start_web()
     await dp.start_polling(bot)
+
 
 if __name__ == "__main__":
     asyncio.run(main())
