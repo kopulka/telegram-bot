@@ -1,6 +1,6 @@
 import asyncio
-import re
 import os
+import re
 from datetime import timedelta
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
@@ -9,9 +9,10 @@ from aiogram.exceptions import TelegramBadRequest
 
 TOKEN = os.getenv("BOT_TOKEN")
 
-BAD_WORDS = [
-    "мат1", "мат2", "мат3"
-]
+if not TOKEN:
+    raise ValueError("BOT_TOKEN not set")
+
+BAD_WORDS = ["мат1", "мат2", "мат3"]
 
 TIME_RE = re.compile(r"на\s+(\d+)\s*(минут|минуты|минута|час|часа|часов|день|дня|дней)", re.IGNORECASE)
 REASON_RE = re.compile(r"причина\s*:\s*(.+)", re.IGNORECASE)
@@ -39,7 +40,7 @@ async def call_admins(message: Message):
 def contains_bad_words(text: str) -> bool:
     t = text.lower()
     for w in BAD_WORDS:
-        if re.search(rf"\b{re.escape(w)}\b", t):
+        if re.search(rf"\\b{re.escape(w)}\\b", t):
             return True
     return False
 
@@ -66,14 +67,12 @@ def parse_time(text: str):
         return timedelta(minutes=value)
     if unit.startswith("час"):
         return timedelta(hours=value)
-    if unit.startswith("ден") or unit.startswith("дне"):
+    if unit.startswith("ден"):
         return timedelta(days=value)
     return None
 
 def format_timedelta(td: timedelta) -> str:
     seconds = int(td.total_seconds())
-    if seconds < 60:
-        return f"{seconds} сек"
     minutes = seconds // 60
     if minutes < 60:
         return f"{minutes} мин"
@@ -86,7 +85,7 @@ def format_timedelta(td: timedelta) -> str:
 @dp.message(Command("бан"))
 async def ban_user(message: Message):
     if not message.reply_to_message:
-        return await message.answer("Команду нужно писать ответом на сообщение пользователя.")
+        return await message.answer("Ответь на сообщение пользователя.")
 
     target = message.reply_to_message.from_user
     reason = parse_reason(message.text)
@@ -94,9 +93,7 @@ async def ban_user(message: Message):
     try:
         await bot.ban_chat_member(message.chat.id, target.id)
         await message.answer(
-            f"🚫 Бан\n"
-            f"Пользователь: @{target.username or target.first_name}\n"
-            f"Причина: {reason}"
+            f"🚫 Бан\nПользователь: {target.full_name}\nПричина: {reason}"
         )
     except TelegramBadRequest as e:
         await message.answer(f"Ошибка: {e}")
@@ -104,7 +101,7 @@ async def ban_user(message: Message):
 @dp.message(Command("мут"))
 async def mute_user(message: Message):
     if not message.reply_to_message:
-        return await message.answer("Команду нужно писать ответом на сообщение пользователя.")
+        return await message.answer("Ответь на сообщение пользователя.")
 
     target = message.reply_to_message.from_user
     reason = parse_reason(message.text)
@@ -124,17 +121,12 @@ async def mute_user(message: Message):
             until_date=until_date
         )
         await message.answer(
-            f"🔇 Мут\n"
-            f"Пользователь: @{target.username or target.first_name}\n"
-            f"Срок: {time_text}\n"
-            f"Причина: {reason}"
+            f"🔇 Мут\nПользователь: {target.full_name}\nСрок: {time_text}\nПричина: {reason}"
         )
     except TelegramBadRequest as e:
         await message.answer(f"Ошибка: {e}")
 
 async def main():
-    if not TOKEN:
-        raise ValueError("BOT_TOKEN not set")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
