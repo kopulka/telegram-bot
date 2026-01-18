@@ -1,249 +1,273 @@
 import asyncio
-import logging
+import os
 import re
-import aiosqlite
 from datetime import datetime, timedelta
 
 from aiogram import Bot, Dispatcher, F
-from aiogram.types import Message, ChatPermissions
 from aiogram.filters import Command
-from aiogram.enums import ParseMode
-from aiogram.utils.markdown import bold
+from aiogram.types import Message, ChatJoinRequest
+from aiogram.enums import ChatMemberStatus
+from aiogram.exceptions import TelegramBadRequest
 
-TOKEN = "ВСТАВЬ_СЮДА_ТОКЕН"
+import aiosqlite
+from aiohttp import web
 
-logging.basicConfig(level=logging.INFO)
+TOKEN = os.getenv("BOT_TOKEN")
+if not TOKEN:
+    raise ValueError("BOT_TOKEN not set")
 
-bot = Bot(TOKEN, parse_mode=ParseMode.HTML)
+bot = Bot(token=TOKEN, parse_mode="HTML")
 dp = Dispatcher()
 
-DB_PATH = "data.db"
-
-# -------------------- DATABASE --------------------
+# ---------- DB ----------
 
 async def init_db():
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect("punishments.db") as db:
         await db.execute("""
-        CREATE TABLE IF NOT EXISTS punishments (
-            user_id INTEGER,
-            username TEXT,
-            type TEXT,
-            until TEXT,
-            reason TEXT,
-            admin TEXT
-        )
+            CREATE TABLE IF NOT EXISTS punishments (
+                user_id INTEGER,
+                chat_id INTEGER,
+                type TEXT,
+                until TEXT,
+                reason TEXT,
+                admin TEXT
+            )
         """)
         await db.commit()
 
-# -------------------- HELPERS --------------------
+async def set_punishment(user_id, chat_id, p_type, until, reason, admin):
+    async with aiosqlite.connect("punishments.db") as db:
+        await db.execute("DELETE FROM punishments WHERE user_id=? AND chat_id=?", (user_id, chat_id))
+        await db.execute(
+            "INSERT INTO punishments VALUES (?, ?, ?, ?, ?, ?)",
+            (user_id, chat_id, p_type, until, reason, admin)
+        )
+        await db.commit()
 
-async def is_admin(chat_id, user_id):
-    member = await bot.get_chat_member(chat_id, user_id)
-    return member.status in ["administrator", "creator"]
+async def clear_punishment(user_id, chat_id):
+    async with aiosqlite.connect("punishments.db") as db:
+        await db.execute("DELETE FROM punishments WHERE user_id=? AND chat_id=?", (user_id, chat_id))
+        await db.commit()
+
+async def get_punishment(user_id, chat_id):
+    async with aiosqlite.connect("punishments.db") as db:
+        async with db.execute(
+            "SELECT type, until, reason, admin FROM punishments WHERE user_id=? AND chat_id=?",
+            (user_id, chat_id)
+        ) as cursor:
+            return await cursor.fetchone()
+
+# ---------- Utils ----------
+
+TIME_RE = re.compile(r"(\d+)\s*(мин|час|дн|день|дня|дней|минута|минут|часа|часов)", re.I)
 
 def parse_time(text):
-    match = re.search(r"(\d+)\s*(мин|м|час|ч|день|д|нед|н)", text.lower())
-    if not match:
+    m = TIME_RE.search(text)
+    if not m:
         return None
+    value = int(m.group(1))
+    unit = m.group(2).lower()
 
-    num = int(match.group(1))
-    unit = match.group(2)
-
-    if unit in ["мин", "м"]:
-        return timedelta(minutes=num)
-    if unit in ["час", "ч"]:
-        return timedelta(hours=num)
-    if unit in ["день", "д"]:
-        return timedelta(days=num)
-    if unit in ["нед", "н"]:
-        return timedelta(weeks=num)
-
+    if unit.startswith("мин"):
+        return timedelta(minutes=value)
+    if unit.startswith("час"):
+        return timedelta(hours=value)
+    if unit.startswith("д"):
+        return timedelta(days=value)
     return None
 
-def extract_username(text):
-    match = re.search(r"@(\w+)", text)
-    return match.group(1) if match else None
+async def is_admin(message: Message):
+    member = await bot.get_chat_member(message.chat.id, message.from_user.id)
+    return member.status in [ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER]
 
-# -------------------- START --------------------
+async def get_target(message: Message):
+    if message.reply_to_message:
+        return message.reply_to_message.from_user
 
-@dp.message(Command("start"))
-async def start(message: Message):
-    await message.answer("Бот работает.")
+    parts = message.text.split()
+    for p in parts:
+        if p.startswith("@"):
+            username = p[1:]
+            try:
+                member = await bot.get_chat_member(message.chat.id, username)
+                return member.user
+            except:
+                return None
+    return None
 
-# -------------------- ADM CALL --------------------
+# ---------- Web (Render) ----------
 
-@dp.message(F.text.lower().startswith("созыв"))
+async def handle(request):
+    return web.Response(text="Bot is running")
+
+async def start_web():
+    app = web.Application()
+    app.router.add_get("/", handle)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    port = int(os.getenv("PORT", 10000))
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+
+# ---------- Handlers ----------
+
+@dp.chat_join_request()
+async def approve_request(join_request: ChatJoinRequest):
+    await join_request.approve()
+
+@dp.message(Command("adm"))
 async def call_admins(message: Message):
-    await message.answer("🚨 <b>ВЫЗОВ АДМИНИСТРАТОРОВ</b>")
+    admins = await bot.get_chat_administrators(message.chat.id)
+    mentions = []
+    for admin in admins:
+        u = admin.user
+        if not u.is_bot:
+            mentions.append(f"@{u.username}" if u.username else u.full_name)
+    await message.answer(f"<b>🚨 СОЗЫВ АДМИНОВ:</b>\n" + ", ".join(mentions))
 
-# -------------------- MUTE --------------------
+# ---------- MUTE ----------
 
 @dp.message(F.text.lower().startswith("мут"))
-async def mute_handler(message: Message):
-    if not await is_admin(message.chat.id, message.from_user.id):
+async def mute_user(message: Message):
+    if not await is_admin(message):
         return
 
-    duration = parse_time(message.text)
-    if not duration:
-        await message.answer("Формат: мут 1 час причина")
-        return
-
-    reason = message.text.split(maxsplit=2)[-1]
-
-    target = None
-
-    if message.reply_to_message:
-        target = message.reply_to_message.from_user
-    else:
-        username = extract_username(message.text)
-        if not username:
-            await message.answer("Нужно reply или @username")
-            return
-        members = await bot.get_chat_administrators(message.chat.id)
-        for m in members:
-            if m.user.username == username:
-                target = m.user
-
+    target = await get_target(message)
     if not target:
-        await message.answer("Пользователь не найден")
-        return
+        return await message.answer("Не найден пользователь.")
 
-    until = datetime.utcnow() + duration
+    delta = parse_time(message.text)
+    if not delta:
+        return await message.answer("Укажи время: 1 час, 10 минут, 2 дня")
 
-    await bot.restrict_chat_member(
-        message.chat.id,
-        target.id,
-        ChatPermissions(can_send_messages=False),
-        until_date=until
-    )
+    reason = message.text.split(target.username if target.username else target.full_name)[-1].strip()
+    until = datetime.utcnow() + delta
 
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "INSERT INTO punishments VALUES (?, ?, ?, ?, ?, ?)",
-            (target.id, target.username, "mute", until.isoformat(), reason, message.from_user.username)
+    try:
+        await bot.restrict_chat_member(message.chat.id, target.id, until_date=until)
+        await set_punishment(
+            target.id,
+            message.chat.id,
+            "mute",
+            until.isoformat(),
+            reason,
+            message.from_user.username or message.from_user.full_name
         )
-        await db.commit()
 
-    await message.answer(
-        f"‼️ Участник @{target.username} замучен до {until.strftime('%d.%m.%Y %H:%M')} админом (@{message.from_user.username})\n\nПричина: {reason}"
-    )
+        await message.answer(
+            f"‼️ <b>Участник @{target.username} замучен до {until.strftime('%d.%m.%Y %H:%M')}</b>\n"
+            f"<b>Админ:</b> @{message.from_user.username}\n"
+            f"<b>Причина:</b> {reason}"
+        )
+    except TelegramBadRequest as e:
+        await message.answer(str(e))
 
-# -------------------- UNMUTE --------------------
+# ---------- UNMUTE ----------
 
 @dp.message(F.text.lower().startswith("размут"))
-async def unmute_handler(message: Message):
-    if not await is_admin(message.chat.id, message.from_user.id):
+async def unmute_user(message: Message):
+    if not await is_admin(message):
         return
 
-    target = None
-
-    if message.reply_to_message:
-        target = message.reply_to_message.from_user
-    else:
-        username = extract_username(message.text)
-        if not username:
-            await message.answer("Нужно reply или @username")
-            return
-
+    target = await get_target(message)
     if not target:
-        return
+        return await message.answer("Не найден пользователь.")
 
-    await bot.restrict_chat_member(
-        message.chat.id,
-        target.id,
-        ChatPermissions(can_send_messages=True)
-    )
-
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("DELETE FROM punishments WHERE user_id=? AND type='mute'", (target.id,))
-        await db.commit()
-
-    await message.answer(f"✅ Участник @{target.username} размучен")
-
-# -------------------- BAN --------------------
-
-@dp.message(F.text.lower().startswith("бан"))
-async def ban_handler(message: Message):
-    if not await is_admin(message.chat.id, message.from_user.id):
-        return
-
-    reason = message.text.split(maxsplit=1)[-1]
-
-    if not message.reply_to_message:
-        await message.answer("Ответь на сообщение")
-        return
-
-    target = message.reply_to_message.from_user
-
-    await bot.ban_chat_member(message.chat.id, target.id)
-
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "INSERT INTO punishments VALUES (?, ?, ?, ?, ?, ?)",
-            (target.id, target.username, "ban", None, reason, message.from_user.username)
-        )
-        await db.commit()
+    await bot.restrict_chat_member(message.chat.id, target.id, permissions=None)
+    await clear_punishment(target.id, message.chat.id)
 
     await message.answer(
-        f"‼️ Участник @{target.username} забанен админом (@{message.from_user.username})\n\nПричина: {reason}"
+        f"✅ <b>Участник @{target.username} размучен</b>\n"
+        f"<b>Админ:</b> @{message.from_user.username}"
     )
 
-# -------------------- UNBAN --------------------
+# ---------- BAN ----------
+
+@dp.message(F.text.lower().startswith("бан"))
+async def ban_user(message: Message):
+    if not await is_admin(message):
+        return
+
+    target = await get_target(message)
+    if not target:
+        return await message.answer("Не найден пользователь.")
+
+    reason = message.text.replace("бан", "").strip()
+
+    try:
+        await bot.ban_chat_member(message.chat.id, target.id)
+        await set_punishment(
+            target.id,
+            message.chat.id,
+            "ban",
+            None,
+            reason,
+            message.from_user.username or message.from_user.full_name
+        )
+
+        await message.answer(
+            f"‼️ <b>Участник @{target.username} забанен</b>\n"
+            f"<b>Админ:</b> @{message.from_user.username}\n"
+            f"<b>Причина:</b> {reason}"
+        )
+    except TelegramBadRequest as e:
+        await message.answer(str(e))
+
+# ---------- UNBAN ----------
 
 @dp.message(F.text.lower().startswith("разбан"))
-async def unban_handler(message: Message):
-    if not await is_admin(message.chat.id, message.from_user.id):
+async def unban_user(message: Message):
+    if not await is_admin(message):
         return
 
-    if not message.reply_to_message:
-        await message.answer("Ответь на сообщение")
-        return
-
-    target = message.reply_to_message.from_user
+    target = await get_target(message)
+    if not target:
+        return await message.answer("Не найден пользователь.")
 
     await bot.unban_chat_member(message.chat.id, target.id)
+    await clear_punishment(target.id, message.chat.id)
 
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("DELETE FROM punishments WHERE user_id=? AND type='ban'", (target.id,))
-        await db.commit()
+    await message.answer(
+        f"✅ <b>Участник @{target.username} разбанен</b>\n"
+        f"<b>Админ:</b> @{message.from_user.username}"
+    )
 
-    await message.answer(f"✅ Участник @{target.username} разбанен")
-
-# -------------------- REASON --------------------
+# ---------- REASON ----------
 
 @dp.message(F.text.lower().startswith("причина"))
-async def reason_handler(message: Message):
-    if not await is_admin(message.chat.id, message.from_user.id):
+async def reason_cmd(message: Message):
+    if not await is_admin(message):
         return
 
-    username = extract_username(message.text)
-    if not username:
-        await message.answer("Формат: причина @username")
-        return
+    target = await get_target(message)
+    if not target:
+        return await message.answer("Не найден пользователь.")
 
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT * FROM punishments WHERE username=?", (username,)) as cur:
-            row = await cur.fetchone()
+    data = await get_punishment(target.id, message.chat.id)
+    if not data:
+        return await message.answer("⭐️ Участник не находится в муте или бане")
 
-    if not row:
-        await message.answer("⭐️ Участник не находится в муте или бане")
-        return
+    p_type, until, reason, admin = data
 
-    _, username, ptype, until, reason, admin = row
-
-    if ptype == "mute":
+    if p_type == "mute":
+        until_dt = datetime.fromisoformat(until)
         await message.answer(
-            f"‼️ Участник @{username} замучен до {until}\n\nПричина: {reason}"
+            f"‼️ <b>Участник @{target.username} в муте до {until_dt.strftime('%d.%m.%Y %H:%M')}</b>\n"
+            f"<b>Админ:</b> @{admin}\n"
+            f"<b>Причина:</b> {reason}"
         )
     else:
         await message.answer(
-            f"‼️ Участник @{username} забанен\n\nПричина: {reason}"
+            f"‼️ <b>Участник @{target.username} в бане</b>\n"
+            f"<b>Админ:</b> @{admin}\n"
+            f"<b>Причина:</b> {reason}"
         )
 
-# -------------------- MAIN --------------------
+# ---------- MAIN ----------
 
 async def main():
     await init_db()
+    await start_web()
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
