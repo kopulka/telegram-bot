@@ -197,13 +197,14 @@ async def unmute_user(message: Message):
             f"✅ <b>Участник @{target.username} размучен</b>\n"
             f"<b>Админ:</b> @{message.from_user.username}"
         )
+
     except TelegramBadRequest as e:
-        await message.answer(str(e))
+        await message.answer(f"Ошибка: {e}")
 
 # ================== BAN ==================
 
-@dp.message(F.text.lower().startswith("бан"))
-async def ban_user(message: Message):
+@dp.message(F.text.lower().startswith("разбан"))
+async def unban_user(message: Message):
     if not await is_admin(message):
         return
 
@@ -211,27 +212,22 @@ async def ban_user(message: Message):
     if not target:
         return await message.answer("Используй ответ на сообщение.")
 
-    reason = message.text.replace("бан", "").strip()
-
     try:
-        await bot.ban_chat_member(message.chat.id, target.id)
-
-        await set_punishment(
-            target.id,
+        await bot.unban_chat_member(
             message.chat.id,
-            "ban",
-            None,
-            reason,
-            message.from_user.username or message.from_user.full_name
+            target.id,
+            only_if_banned=True
         )
+
+        await clear_punishment(target.id, message.chat.id)
 
         await message.answer(
-            f"‼️ <b>Участник @{target.username} забанен</b>\n"
-            f"<b>Админ:</b> @{message.from_user.username}\n"
-            f"<b>Причина:</b> {reason}"
+            f"✅ <b>Участник @{target.username} разбанен</b>\n"
+            f"<b>Админ:</b> @{message.from_user.username}"
         )
+
     except TelegramBadRequest as e:
-        await message.answer(str(e))
+        await message.answer(f"Ошибка: {e}")
 
 # ================== UNBAN ==================
 
