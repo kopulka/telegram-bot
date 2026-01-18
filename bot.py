@@ -5,7 +5,7 @@ from datetime import datetime, timedelta
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
-from aiogram.types import Message, ChatJoinRequest
+from aiogram.types import Message, ChatJoinRequest, ChatPermissions
 from aiogram.enums import ChatMemberStatus
 from aiogram.exceptions import TelegramBadRequest
 
@@ -19,7 +19,7 @@ if not TOKEN:
 bot = Bot(token=TOKEN, parse_mode="HTML")
 dp = Dispatcher()
 
-# ---------- DB ----------
+# ================== DATABASE ==================
 
 async def init_db():
     async with aiosqlite.connect("punishments.db") as db:
@@ -57,9 +57,9 @@ async def get_punishment(user_id, chat_id):
         ) as cursor:
             return await cursor.fetchone()
 
-# ---------- Utils ----------
+# ================== UTILS ==================
 
-TIME_RE = re.compile(r"(\d+)\s*(мин|час|дн|день|дня|дней|минута|минут|часа|часов)", re.I)
+TIME_RE = re.compile(r"(\d+)\s*(мин|минута|минут|час|часа|часов|дн|день|дня|дней)", re.I)
 
 def parse_time(text):
     m = TIME_RE.search(text)
@@ -84,18 +84,18 @@ async def get_target(message: Message):
     if message.reply_to_message:
         return message.reply_to_message.from_user
 
+    if message.entities:
+        for ent in message.entities:
+            if ent.type == "text_mention":
+                return ent.user
+
     parts = message.text.split()
     for p in parts:
         if p.startswith("@"):
-            username = p[1:]
-            try:
-                member = await bot.get_chat_member(message.chat.id, username)
-                return member.user
-            except:
-                return None
+            return None  # Telegram не даёт надёжно получить user по username
     return None
 
-# ---------- Web (Render) ----------
+# ================== WEB (Render) ==================
 
 async def handle(request):
     return web.Response(text="Bot is running")
@@ -109,7 +109,7 @@ async def start_web():
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
 
-# ---------- Handlers ----------
+# ================== HANDLERS ==================
 
 @dp.chat_join_request()
 async def approve_request(join_request: ChatJoinRequest):
@@ -125,7 +125,7 @@ async def call_admins(message: Message):
             mentions.append(f"@{u.username}" if u.username else u.full_name)
     await message.answer(f"<b>🚨 СОЗЫВ АДМИНОВ:</b>\n" + ", ".join(mentions))
 
-# ---------- MUTE ----------
+# ================== MUTE ==================
 
 @dp.message(F.text.lower().startswith("мут"))
 async def mute_user(message: Message):
@@ -134,17 +134,23 @@ async def mute_user(message: Message):
 
     target = await get_target(message)
     if not target:
-        return await message.answer("Не найден пользователь.")
+        return await message.answer("Используй ответ на сообщение.")
 
     delta = parse_time(message.text)
     if not delta:
-        return await message.answer("Укажи время: 1 час, 10 минут, 2 дня")
+        return await message.answer("Формат: мут 1 час причина")
 
-    reason = message.text.split(target.username if target.username else target.full_name)[-1].strip()
+    reason = message.text.split()[-1]
     until = datetime.utcnow() + delta
 
     try:
-        await bot.restrict_chat_member(message.chat.id, target.id, until_date=until)
+        await bot.restrict_chat_member(
+            message.chat.id,
+            target.id,
+            permissions=ChatPermissions(can_send_messages=False),
+            until_date=until
+        )
+
         await set_punishment(
             target.id,
             message.chat.id,
@@ -162,7 +168,7 @@ async def mute_user(message: Message):
     except TelegramBadRequest as e:
         await message.answer(str(e))
 
-# ---------- UNMUTE ----------
+# ================== UNMUTE ==================
 
 @dp.message(F.text.lower().startswith("размут"))
 async def unmute_user(message: Message):
@@ -171,17 +177,30 @@ async def unmute_user(message: Message):
 
     target = await get_target(message)
     if not target:
-        return await message.answer("Не найден пользователь.")
+        return await message.answer("Используй ответ на сообщение.")
 
-    await bot.restrict_chat_member(message.chat.id, target.id, permissions=None)
-    await clear_punishment(target.id, message.chat.id)
+    try:
+        await bot.restrict_chat_member(
+            message.chat.id,
+            target.id,
+            permissions=ChatPermissions(
+                can_send_messages=True,
+                can_send_media_messages=True,
+                can_send_other_messages=True,
+                can_add_web_page_previews=True
+            )
+        )
 
-    await message.answer(
-        f"✅ <b>Участник @{target.username} размучен</b>\n"
-        f"<b>Админ:</b> @{message.from_user.username}"
-    )
+        await clear_punishment(target.id, message.chat.id)
 
-# ---------- BAN ----------
+        await message.answer(
+            f"✅ <b>Участник @{target.username} размучен</b>\n"
+            f"<b>Админ:</b> @{message.from_user.username}"
+        )
+    except TelegramBadRequest as e:
+        await message.answer(str(e))
+
+# ================== BAN ==================
 
 @dp.message(F.text.lower().startswith("бан"))
 async def ban_user(message: Message):
@@ -190,12 +209,13 @@ async def ban_user(message: Message):
 
     target = await get_target(message)
     if not target:
-        return await message.answer("Не найден пользователь.")
+        return await message.answer("Используй ответ на сообщение.")
 
     reason = message.text.replace("бан", "").strip()
 
     try:
         await bot.ban_chat_member(message.chat.id, target.id)
+
         await set_punishment(
             target.id,
             message.chat.id,
@@ -213,7 +233,7 @@ async def ban_user(message: Message):
     except TelegramBadRequest as e:
         await message.answer(str(e))
 
-# ---------- UNBAN ----------
+# ================== UNBAN ==================
 
 @dp.message(F.text.lower().startswith("разбан"))
 async def unban_user(message: Message):
@@ -222,17 +242,20 @@ async def unban_user(message: Message):
 
     target = await get_target(message)
     if not target:
-        return await message.answer("Не найден пользователь.")
+        return await message.answer("Используй ответ на сообщение.")
 
-    await bot.unban_chat_member(message.chat.id, target.id)
-    await clear_punishment(target.id, message.chat.id)
+    try:
+        await bot.unban_chat_member(message.chat.id, target.id)
+        await clear_punishment(target.id, message.chat.id)
 
-    await message.answer(
-        f"✅ <b>Участник @{target.username} разбанен</b>\n"
-        f"<b>Админ:</b> @{message.from_user.username}"
-    )
+        await message.answer(
+            f"✅ <b>Участник @{target.username} разбанен</b>\n"
+            f"<b>Админ:</b> @{message.from_user.username}"
+        )
+    except TelegramBadRequest as e:
+        await message.answer(str(e))
 
-# ---------- REASON ----------
+# ================== REASON ==================
 
 @dp.message(F.text.lower().startswith("причина"))
 async def reason_cmd(message: Message):
@@ -241,7 +264,7 @@ async def reason_cmd(message: Message):
 
     target = await get_target(message)
     if not target:
-        return await message.answer("Не найден пользователь.")
+        return await message.answer("Используй ответ на сообщение.")
 
     data = await get_punishment(target.id, message.chat.id)
     if not data:
@@ -263,7 +286,7 @@ async def reason_cmd(message: Message):
             f"<b>Причина:</b> {reason}"
         )
 
-# ---------- MAIN ----------
+# ================== MAIN ==================
 
 async def main():
     await init_db()
